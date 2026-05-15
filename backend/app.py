@@ -6,9 +6,14 @@ import os
 import joblib
 import warnings
 
-warnings.filterwarnings('ignore', category=UserWarning)
-warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore')
 
+from gmail_api import (
+    build_gmail_service,
+    list_unread_messages,
+    get_message_payload,
+    extract_email_body
+)
 
 from feature_extraction import (
     extract_email_text_features,
@@ -16,299 +21,666 @@ from feature_extraction import (
     extract_url_features,
     extract_email_address_features,
     fuse_features,
-    FEATURE_NAMES,
 )
-from settings import MODEL_PATHS
-from model_ensemble import EnsembleClassifier
-from shap_explainer import SHAPTopFeatures
 
+from settings import MODEL_PATHS, FEATURE_DIMENSIONS
 
 app = Flask(__name__, static_folder='../frontend')
 
+# =====================================================
+# CORS
+# =====================================================
 
-
-# Enable CORS
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
     return response
 
-# Load model
-script_dir = os.path.dirname(os.path.abspath(__file__))
 
-xgb_model = xgb.XGBClassifier(objective='binary:logistic', n_estimators=100, use_label_encoder=False, eval_metric='logloss')
+# =====================================================
+# LOAD MODEL
+# =====================================================
+
+print("Loading model...")
+
+xgb_model = xgb.XGBClassifier()
+
+xgb_model.load_model(MODEL_PATHS['xgb'])
+
+scaler = joblib.load(MODEL_PATHS['scaler'])
+
 model = xgb_model
-ensemble_path = MODEL_PATHS.get('ensemble')
-xgb_path = MODEL_PATHS.get('xgb')
-scaler_path = MODEL_PATHS.get('scaler')
 
-if ensemble_path and os.path.exists(ensemble_path):
-    try:
-        model = EnsembleClassifier.load(ensemble_path)
-        print(f'Loaded ensemble model from {ensemble_path}')
-    except Exception as e:
-        print(f'Could not load ensemble model: {e}. Falling back to XGBoost baseline.')
+print("Model loaded successfully!")
 
-if model is xgb_model and xgb_path and os.path.exists(xgb_path):
-    xgb_model.load_model(xgb_path)
 
-if scaler_path and os.path.exists(scaler_path):
-    scaler = joblib.load(scaler_path)
-else:
-    raise FileNotFoundError(f'Scaler file not found: {scaler_path}')
-
-# Initialize SHAP helper here after model and scaler are loaded
-# SHAP TreeExplainer fails on VotingClassifier, so we extract the base XGBoost tree
-base_tree_model = model
-if hasattr(model, 'model') and hasattr(model.model, 'estimators_'):
-    for name, est in zip(model.model.estimators, model.model.estimators_):
-        if name[0] == 'xgb':
-            base_tree_model = est
-            break
-
-shap_helper = SHAPTopFeatures(model=base_tree_model, scaler=scaler)
-
-# Lazy load DistilBERT model (to save memory)
-
-distilbert_model = None
-
-def get_distilbert_model():
-    global distilbert_model
-    if distilbert_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            print("Loading DistilBERT model...")
-            distilbert_model = SentenceTransformer('distilbert-base-uncased')
-            print("DistilBERT model loaded successfully!")
-        except Exception as e:
-            print(f"Warning: Could not load DistilBERT: {e}")
-            return None
-    return distilbert_model
-
-# -----------------------------
-# TEXT PROCESSING
+# =====================================================
+# HELPERS
+# =====================================================
 
 def clean_email_text(text):
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\\s+', ' ', str(text))
     return text.strip()
 
-# -----------------------------
-# MODEL PREDICTION
+
+def safe_vector(arr, size):
+    arr = np.array(arr, dtype=float).flatten()
+
+    if len(arr) < size:
+        arr = np.concatenate([arr, np.zeros(size - len(arr))])
+
+    elif len(arr) > size:
+        arr = arr[:size]
+
+    return arr
+
 
 def classify_phishing(features):
-    features_scaled = scaler.transform([features])
-    return float(model.predict_proba(features_scaled)[0][1])
+    features = np.array(features, dtype=float).reshape(1, -1)
+
+    features_scaled = scaler.transform(features)
+
+    prob = model.predict_proba(features_scaled)[0][1]
+
+    return float(prob)
 
 
-
-# -----------------------------
-# DISTILBERT EMBEDDINGS
-# -----------------------------
-
-def get_text_embedding(text):
-    """Get DistilBERT embedding for text"""
-    model = get_distilbert_model()
-
-    if model is None:
-        return np.zeros(768)  # Return zeros if model not available
-    embedding = model.encode(text, convert_to_numpy=True)
-    return embedding
-
-def get_combined_embedding(email_text, url, email_address):
-    """Combine embeddings from email, URL, and email address"""
-    # Get individual embeddings
-    email_emb = get_text_embedding(email_text[:512])  # Truncate to max length
-    
-    # For URL, create a description
-    url_desc = f"URL: {url}"
-    url_emb = get_text_embedding(url_desc)
-    
-    # For email address
-    email_addr_emb = get_text_embedding(email_address)
-    
-    # Combine embeddings (average)
-    combined = (email_emb + url_emb + email_addr_emb) / 3
-    
-    return combined
-
-# -----------------------------
-# LLAMA REASONING
-# -----------------------------
-
-def generate_reasoning(email_text, url, email_address, prediction, probability, top_features):
-    """Generate human-readable reasoning using Llama-style analysis"""
-    
-    # Analyze key factors from SHAP values
-    positive_factors = [k for k, v in top_features.items() if v > 0]
-    negative_factors = [k for k, v in top_features.items() if v < 0]
-    
-    is_phishing = prediction.lower() == "phishing" or prediction.lower() == "phishing website"
-    confidence = probability * 100
-    
-    # Build reasoning
-    reasoning_parts = []
-    
-    if is_phishing:
-        reasoning_parts.append("⚠️ This content has been flagged as a potential PHISHING threat.")
-    else:
-        reasoning_parts.append("✅ This content appears to be LEGITIMATE.")
-    
-    reasoning_parts.append(f"\n📊 Confidence Score: {confidence:.1f}%")
-    
-    if positive_factors:
-        reasoning_parts.append(f"\n🔴 Risk indicators detected: {', '.join(positive_factors[:5])}")
-    
-    if negative_factors:
-        reasoning_parts.append(f"\n🟢 Trust indicators: {', '.join(negative_factors[:5])}")
-    
-    # Add specific observations based on content
-    text_lower = email_text.lower() if email_text else ""
-    url_lower = url.lower() if url else ""
-    
-    if any(word in text_lower for word in ['urgent', 'verify', 'password', 'click here', 'account']):
-        reasoning_parts.append("\n⚡ Urgent language detected - common in phishing attempts")
-    
-    if '@' in email_address and any(domain in email_address.lower() for domain in ['gmail.com', 'yahoo.com', 'hotmail.com']):
-        reasoning_parts.append("\n📧 Free email provider detected - verify sender authenticity")
-    
-    if url and not url.startswith('https'):
-        reasoning_parts.append("\n🔒 Non-secure connection (HTTP instead of HTTPS)")
-    
-    return "\n".join(reasoning_parts)
-
-# -----------------------------
-# RISK SCORE CALCULATION
-# -----------------------------
-
-def calculate_risk_score(probability, top_features, email_text, url):
-    """Calculate overall risk score (0-100)"""
-    base_score = probability * 100
-    
-    # Adjust based on content analysis
-    adjustments = 0
-    
-    text_lower = email_text.lower() if email_text else ""
-    url_lower = url.lower() if url else ""
-    
-    # High-risk keywords
-    if any(word in text_lower for word in ['urgent', 'verify', 'password', 'click here', 'immediate', 'suspended']):
-        adjustments += 10
-    
-    # Suspicious URL patterns
-    if url:
-        if '-' in url or '@' in url or 'ip' in url_lower:
-            adjustments += 15
-        if not url.startswith('https'):
-            adjustments += 10
-    
-    # Adjust based on SHAP feature importance
-    if top_features:
-        high_impact_features = [k for k, v in top_features.items() if abs(v) > 0.3]
-        adjustments += len(high_impact_features) * 5
-    
-    final_score = min(100, base_score + adjustments)
-    return round(final_score, 1)
-
-# -----------------------------
+# =====================================================
 # ROUTES
-# -----------------------------
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    data = request.json
-
-    email_text = clean_email_text(data.get('email_text', ''))
-    text_lower = email_text.lower()
-
-    suspicious_words = ['click', 'verify', 'password', 'login', 'pay', 'urgent']
-
-    # Processing all emails without early return to ensure SHAP features are generated
-    email_address = data.get('email_address', '')
-
-    email_text_feats = extract_email_text_features(email_text)
-
-    urls = extract_urls(email_text)
-    url_features = [extract_url_features(url) for url in urls]
-
-    email_addr_feats = extract_email_address_features(email_address)
-
-    fused = fuse_features(email_text_feats, url_features, email_addr_feats)
-
-    prob = classify_phishing(fused)
-    classification = 'Phishing' if prob > 0.7 else 'Legitimate'
-
-    # SHAP/top-feature explanation (robust + no random placeholders)
-    top_by_cat = shap_helper.explain_top_features_by_category(fused)
-
-    # Generate reasoning from all top features combined
-    url_from_email = urls[0] if urls else ''
-    all_top = {
-        **top_by_cat.get('email_text', {}),
-        **top_by_cat.get('url', {}),
-        **top_by_cat.get('email_address', {}),
-    }
-    reasoning = generate_reasoning(email_text, url_from_email, email_address, classification, prob, all_top)
-
-    
-    # Calculate risk score
-    risk_score = calculate_risk_score(prob, all_top, email_text, url_from_email)
-
-
-    return jsonify({
-        'probability': float(prob),
-        'classification': classification,
-        'confidence_label': f"{(prob * 100):.1f}%",
-        'top_email_features': top_by_cat.get('email_text', {}),
-        'top_url_features': top_by_cat.get('url', {}),
-        'top_email_address_features': top_by_cat.get('email_address', {}),
-        'reasoning': reasoning,
-        'risk_score': risk_score,
-        'ensemble_breakdown': getattr(model, 'last_votes', {}),
-        'model_version': getattr(model, 'version', 'v1.0')
-    })
-
-@app.route('/predict_url', methods=['POST'])
-def predict_url():
-    data = request.json
-    url = data.get('url', '')
-
-    # Extract URL features
-    url_feats = extract_url_features(url)
-
-    # Empty email + sender features (to match model input size)
-    email_text_feats = np.zeros(13)
-    email_addr_feats = np.zeros(8)
-
-    fused = np.concatenate([email_text_feats, url_feats, email_addr_feats])
-
-    prob = classify_phishing(fused)
-    classification = 'Phishing Website' if prob > 0.5 else 'Safe Website'
-
-    top_by_cat = shap_helper.explain_top_features_by_category(fused)
-    url_shap = top_by_cat.get('url', {})
-
-    # Generate reasoning from URL features only (email features are zeroed out)
-    reasoning = generate_reasoning('', url, '', classification, prob, url_shap)
-    
-    # Calculate risk score
-    risk_score = calculate_risk_score(prob, url_shap, '', url)
-
-    return jsonify({
-        'probability': float(prob),
-        'classification': classification,
-        'confidence_label': f"{(prob * 100):.1f}%",
-        'top_url_features': url_shap,
-        'reasoning': reasoning,
-        'risk_score': risk_score,
-        'ensemble_breakdown': getattr(model, 'last_votes', {}),
-        'model_version': getattr(model, 'version', 'v1.0')
-    })
+# =====================================================
 
 @app.route('/')
 def index():
     return send_from_directory('../frontend', 'index.html')
 
+
+@app.route('/health')
+def health():
+    return jsonify({
+        'status': 'ok'
+    })
+
+
+# =====================================================
+# EMAIL PREDICTION
+# =====================================================
+
+@app.route('/predict', methods=['POST'])
+@app.route('/predict', methods=['POST'])
+def predict():
+
+    try:
+
+        data = request.json
+
+        email_text = clean_email_text(
+            data.get('email_text', '')
+        )
+
+        email_address = data.get(
+            'email_address',
+            ''
+        )
+
+        # ---------------------------------------------
+        # BASIC VALIDATION
+        # ---------------------------------------------
+
+        if not email_text.strip():
+
+            return jsonify({
+                'error': 'Please enter email content.'
+            }), 400
+
+        # ---------------------------------------------
+        # FEATURE EXTRACTION
+        # ---------------------------------------------
+
+        email_feats = safe_vector(
+            extract_email_text_features(email_text),
+            FEATURE_DIMENSIONS['email_text']
+        )
+
+        urls = extract_urls(email_text)
+
+        url_feature_list = []
+
+        for u in urls:
+
+            try:
+
+                url_feature_list.append(
+                    safe_vector(
+                        extract_url_features(u),
+                        FEATURE_DIMENSIONS['url']
+                    )
+                )
+
+            except:
+                continue
+
+        if url_feature_list:
+
+            url_feats = np.mean(
+                url_feature_list,
+                axis=0
+            )
+
+        else:
+
+            url_feats = np.zeros(
+                FEATURE_DIMENSIONS['url']
+            )
+
+        email_addr_feats = safe_vector(
+            extract_email_address_features(email_address),
+            FEATURE_DIMENSIONS['email_address']
+        )
+
+        fused = np.concatenate([
+            email_feats,
+            url_feats,
+            email_addr_feats
+        ])
+
+        # ---------------------------------------------
+        # MODEL PREDICTION
+        # ---------------------------------------------
+
+        prob = classify_phishing(fused)
+
+        raw_score = round(prob * 100, 1)
+
+        # ---------------------------------------------
+        # CLASSIFICATION LOGIC
+        # ---------------------------------------------
+
+        if raw_score >= 95:
+
+            classification = 'Phishing'
+
+        elif raw_score >= 85:
+
+            classification = 'Suspicious'
+
+        else:
+
+            classification = 'Legitimate'
+
+        # ---------------------------------------------
+        # DISPLAY RISK SCORE
+        # ---------------------------------------------
+
+        display_score = raw_score
+
+        # Short email calibration
+        if len(email_text.strip()) < 5:
+
+            display_score = min(display_score, 45)
+
+        elif len(email_text.strip()) < 15:
+
+            display_score = min(display_score, 55)
+
+        # UI consistency calibration
+        if classification == 'Legitimate':
+
+            display_score = min(display_score, 35)
+            risk_level = 'Low'
+
+        elif classification == 'Suspicious':
+
+            display_score = max(
+                min(display_score, 75),
+                45
+            )
+
+            risk_level = 'Medium'
+
+        else:
+
+            display_score = max(display_score, 85)
+            risk_level = 'High'
+
+        # ---------------------------------------------
+        # REASONING
+        # ---------------------------------------------
+
+        if len(email_text.strip()) < 15:
+
+            reasoning = (
+                'Short email detected. '
+                'Prediction confidence may be lower.'
+            )
+
+        elif classification == 'Phishing':
+
+            reasoning = (
+                'Potential phishing indicators detected.'
+            )
+
+        elif classification == 'Suspicious':
+
+            reasoning = (
+                'Some suspicious linguistic or URL patterns detected.'
+            )
+
+        else:
+
+            reasoning = (
+                'Content appears legitimate.'
+            )
+
+        # ---------------------------------------------
+        # RESPONSE
+        # ---------------------------------------------
+
+        return jsonify({
+
+            'probability': prob,
+
+            'classification': classification,
+
+            'risk_score': display_score,
+
+            'risk_level': risk_level,
+
+            'confidence_label': f'{display_score:.1f}%',
+
+            'top_email_features': {},
+
+            'top_url_features': {},
+
+            'top_email_address_features': {},
+
+            'reasoning': reasoning,
+
+            'ensemble_breakdown': {},
+
+            'model_version': 'v2-stable'
+        })
+
+    except Exception as e:
+
+        print("PREDICT ERROR:", str(e))
+
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+# =====================================================
+# URL PREDICTION
+# =====================================================
+
+@app.route('/predict_url', methods=['POST'])
+def predict_url():
+
+    try:
+
+        data = request.json
+
+        url = str(data.get('url', '')).strip()
+
+        trusted_domains = [
+            'google.com',
+            'youtube.com',
+            'microsoft.com',
+            'github.com',
+            'openai.com',
+            'amazon.com',
+            'paypal.com',
+            'apple.com',
+            'facebook.com',
+            'instagram.com',
+            'linkedin.com',
+            'wikipedia.org'
+        ]
+
+        for domain in trusted_domains:
+
+            if domain in url.lower():
+
+                return jsonify({
+
+                    'probability': 0.01,
+
+                    'classification': 'Safe Website',
+
+                    'risk_score': 1,
+
+                    'confidence_label': '99%',
+
+                    'top_url_features': {},
+
+                    'reasoning':
+                        'Trusted domain detected.',
+
+                    'ensemble_breakdown': {},
+
+                    'model_version': 'v2-stable'
+                })
+
+        if len(url) < 3:
+            return jsonify({
+                'error': 'Invalid URL'
+            }), 400
+
+        url_feats = safe_vector(
+            extract_url_features(url),
+            FEATURE_DIMENSIONS['url']
+        )
+
+        email_feats = np.zeros(
+            FEATURE_DIMENSIONS['email_text']
+        )
+
+        email_addr_feats = np.zeros(
+            FEATURE_DIMENSIONS['email_address']
+        )
+
+        fused = np.concatenate([
+            email_feats,
+            url_feats,
+            email_addr_feats
+        ])
+
+        prob = classify_phishing(fused)
+
+        classification = (
+            'Phishing Website'
+            if prob > 0.85
+            else 'Safe Website'
+        )
+
+        risk_score = round(prob * 100, 1)
+
+        return jsonify({
+            'probability': prob,
+            'classification': classification,
+            'risk_score': risk_score,
+            'confidence_label': f'{risk_score:.1f}%',
+
+            'top_url_features': {},
+
+            'reasoning': (
+                'Suspicious URL patterns detected.'
+                if classification == 'Phishing Website'
+                else 'Website appears safe.'
+            ),
+
+            'ensemble_breakdown': {},
+            'model_version': 'v2-stable'
+        })
+
+    except Exception as e:
+
+        print("URL PREDICT ERROR:", str(e))
+
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+
+# =====================================================
+# START SERVER
+# =====================================================
+
+@app.route('/scan_gmail', methods=['GET'])
+def scan_gmail():
+
+    try:
+
+        service = build_gmail_service(
+            credentials_path='credentials.json'
+        )
+
+        messages = list_unread_messages(
+            service,
+            max_results=10
+        )
+
+        results = []
+
+        for msg in messages:
+
+            payload = get_message_payload(
+                service,
+                msg['id']
+            )
+
+            email_body = extract_email_body(payload)
+
+            if not email_body:
+                continue
+
+            email_feats = safe_vector(
+                extract_email_text_features(email_body),
+                FEATURE_DIMENSIONS['email_text']
+            )
+
+            urls = extract_urls(email_body)
+
+            url_feature_list = []
+
+            for u in urls:
+
+                try:
+
+                    url_feature_list.append(
+                        safe_vector(
+                            extract_url_features(u),
+                            FEATURE_DIMENSIONS['url']
+                        )
+                    )
+
+                except:
+                    continue
+
+            if url_feature_list:
+
+                url_feats = np.mean(
+                    url_feature_list,
+                    axis=0
+                )
+
+            else:
+
+                url_feats = np.zeros(
+                    FEATURE_DIMENSIONS['url']
+                )
+
+            email_addr_feats = np.zeros(
+                FEATURE_DIMENSIONS['email_address']
+            )
+
+            fused = np.concatenate([
+                email_feats,
+                url_feats,
+                email_addr_feats
+            ])
+
+            prob = classify_phishing(fused)
+
+            if prob > 0.95:
+                classification = 'Phishing'
+                color = '#dc3545'
+
+            elif prob > 0.9:
+                classification = 'Suspicious'
+                color = '#ffc107'
+
+            else:
+                classification = 'Legitimate'
+                color = '#28a745'
+
+            results.append({
+                'snippet': (
+                    email_body
+                    .replace('\n', '<br>')
+                    .replace('\r', '')
+                    .strip()[:250]
+                ),
+                'classification': classification,
+                'probability': round(prob * 100, 2),
+                'color': color
+            })
+
+        # ============================================
+        # BUILD HTML UI
+        # ============================================
+
+        html = """
+
+        <html>
+
+        <head>
+
+        <title>PhishGuard Gmail Scan</title>
+
+        <style>
+
+        body{
+            font-family:Arial;
+            background:#0f172a;
+            color:white;
+            padding:30px;
+        }
+
+        h1{
+            text-align:center;
+            margin-bottom:40px;
+        }
+
+        .card{
+            background:#1e293b;
+            padding:20px;
+            border-radius:12px;
+            margin-bottom:20px;
+            box-shadow:0 0 10px rgba(0,0,0,0.4);
+        }
+
+        .badge{
+            padding:6px 14px;
+            border-radius:8px;
+            color:white;
+            font-weight:bold;
+            display:inline-block;
+            margin-bottom:10px;
+        }
+
+        .prob{
+            margin-top:10px;
+            font-size:18px;
+        }
+
+        .snippet{
+            margin-top:15px;
+            line-height:1.6;
+            color:#d1d5db;
+            white-space:pre-wrap;
+        }
+
+        </style>
+
+        </head>
+
+        <body>
+
+        <h1>📧 Gmail Inbox Scan Results</h1>
+
+        """
+
+        phishing_count = 0
+        suspicious_count = 0
+        legit_count = 0
+
+        for r in results:
+
+            if r['classification'] == 'Phishing':
+                phishing_count += 1
+
+            elif r['classification'] == 'Suspicious':
+                suspicious_count += 1
+
+            else:
+                legit_count += 1
+
+            html += f"""
+
+            <div class="card">
+
+                <div
+                    class="badge"
+                    style="background:{r['color']};"
+                >
+                    {r['classification']}
+                </div>
+
+                <div class="prob">
+                    Risk Score:
+                    {r['probability']}%
+                </div>
+
+                <div class="snippet">
+                    {r['snippet']}
+                </div>
+
+            </div>
+
+            """
+
+        html = f"""
+
+        <div style="
+            display:flex;
+            gap:20px;
+            margin-bottom:40px;
+            justify-content:center;
+        ">
+
+            <div class="card">
+                ✅ Legitimate: {legit_count}
+            </div>
+
+            <div class="card">
+                ⚠ Suspicious: {suspicious_count}
+            </div>
+
+            <div class="card">
+                🚨 Phishing: {phishing_count}
+            </div>
+
+        </div>
+
+        """ + html
+
+        html += """
+
+        </body>
+        </html>
+
+        """
+
+        return html
+
+    except Exception as e:
+
+        print("GMAIL SCAN ERROR:", str(e))
+
+        return f"""
+
+        <h1>Gmail Scan Error</h1>
+
+        <p>{str(e)}</p>
+
+        """
+
 if __name__ == '__main__':
-    app.run(debug=True)
+
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=True
+    )
