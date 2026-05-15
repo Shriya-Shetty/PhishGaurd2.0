@@ -8,6 +8,7 @@ MODEL_DIR = BASE_DIR
 DATASET_PATHS = {
     'email': str(DATASET_DIR / 'CEAS_08.csv'),
     'url': str(DATASET_DIR / 'urldata.csv'),
+    'phishtank': str(DATASET_DIR / 'dataset_phishtank.csv')
 }
 
 MODEL_PATHS = {

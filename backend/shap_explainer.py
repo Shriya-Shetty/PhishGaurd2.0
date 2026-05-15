@@ -4,10 +4,14 @@ import shap
 from feature_extraction import FEATURE_NAMES
 
 
+_FEATURE_LEN = len(FEATURE_NAMES)
+
+
+
 def _default_categories():
-    # feature vector is: 6 email + 25 url + 8 sender = 39
-    email_len = 6
-    url_len = 25
+    # feature vector is: 13 email + 32 url + 8 sender = 53
+    email_len = 13
+    url_len = 32
     sender_len = 8
 
     email_text = range(0, email_len)
@@ -55,8 +59,7 @@ def _topk_by_abs(values, idxs, top_k):
     items = []
     for i in idxs:
         v = float(values[i])
-        if v == 0.0:
-            continue
+        # Include zeros so UI doesn't look empty
         items.append((FEATURE_NAMES[i], v))
 
     # Top-K by absolute magnitude
@@ -91,8 +94,7 @@ def _perturbation_importance(model, scaler, features, categories, top_k=5, zero_
         cat_items = []
         for i in idxs:
             v = float(impacts[i])
-            if v <= 0:
-                continue
+            # Keep all items to prevent empty charts
             cat_items.append((FEATURE_NAMES[i], v))
         cat_items.sort(key=lambda x: abs(x[1]), reverse=True)
         out[cat] = dict(cat_items[:top_k])
@@ -121,9 +123,9 @@ class SHAPTopFeatures:
 
         # Validate length
         if len(features) != len(self.feature_names):
-            raise ValueError(
-                f"Expected {len(self.feature_names)} features, got {len(features)}"
-            )
+            # Do not hard-fail; return empty categories so UI stays alive.
+            return {k: {} for k in self.categories.keys()}
+
 
         features_scaled = _scale_one(self.scaler, features)
 

@@ -169,6 +169,14 @@ document.getElementById('form').addEventListener('submit', async function(e) {
                 <pre style="white-space: pre-wrap; font-family: Arial, sans-serif; font-size: 14px;">${data.reasoning || 'No reasoning available'}</pre>
             </div>
 
+            <div style="margin: 20px 0; padding: 15px; background: #fff3cd; border-radius: 8px; border-left: 4px solid #ffc107;">
+                <h3>🧠 Model Ensemble Details (Version: ${data.model_version || 'unknown'})</h3>
+                <p>Breakdown of voting probabilities:</p>
+                <ul>
+                    ${Object.entries(data.ensemble_breakdown || {}).map(([model, prob]) => `<li><b>${model}</b>: ${(prob * 100).toFixed(2)}% phishing</li>`).join('') || '<li>Standard Model Used</li>'}
+                </ul>
+            </div>
+
             <div style="margin: 20px 0; padding: 15px; background: #fff; border-radius: 8px; border: 1px solid #dee2e6;">
                 <h3>🔍 Top SHAP Features</h3>
                 <div id="shapEmail" style="margin-top:10px;"></div>

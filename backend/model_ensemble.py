@@ -22,10 +22,12 @@ def _make_estimators():
 
 
 class EnsembleClassifier:
-    def __init__(self, voting='soft'):
+    def __init__(self, voting='soft', version='v1.1-Ensemble'):
         self.voting = voting
+        self.version = version
         self.model = VotingClassifier(estimators=_make_estimators(), voting=voting, flatten_transform=True)
         self.scaler = None
+        self.last_votes = {}
 
     def fit(self, X, y):
         self.scaler = joblib.load('scaler.pkl') if os.path.exists('scaler.pkl') else None
@@ -33,7 +35,18 @@ class EnsembleClassifier:
         return self
 
     def predict_proba(self, X):
-        return self.model.predict_proba(X)
+        prob = self.model.predict_proba(X)
+        if hasattr(self.model, 'estimators_'):
+            votes = {}
+            for name, estimator in zip(self.model.estimators, self.model.estimators_):
+                try:
+                    # just save the prediction of the first item for UI
+                    p = float(estimator.predict_proba(X[0:1])[0][1])
+                    votes[name[0]] = round(p, 3)
+                except Exception:
+                    pass
+            self.last_votes = votes
+        return prob
 
     def predict(self, X):
         return self.model.predict(X)

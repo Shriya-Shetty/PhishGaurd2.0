@@ -19,7 +19,8 @@ from settings import DATASET_PATHS, MODEL_PATHS
 def load_datasets():
     email_df = pd.read_csv(DATASET_PATHS['email'])
     url_df = pd.read_csv(DATASET_PATHS['url'])
-    return email_df, url_df
+    phishtank_df = pd.read_csv(DATASET_PATHS.get('phishtank', ''))
+    return email_df, url_df, phishtank_df
 
 
 def normalize_labels(df, label_column):
@@ -31,16 +32,17 @@ def normalize_labels(df, label_column):
     return df
 
 
-def build_feature_matrix(email_df, url_df):
+def build_feature_matrix(email_df, url_df, phishtank_df):
     X = []
     y = []
 
     for _, row in email_df.head(2000).iterrows():
         text = str(row.get('body') or row.get('text') or '')
         label = int(row.get('label', 0))
+        sender = str(row.get('sender') or 'user@example.com')
         email_feats = extract_email_text_features(text)
         url_feats = [extract_url_features(u) for u in extract_urls(text)]
-        email_addr_feats = extract_email_address_features('user@example.com')
+        email_addr_feats = extract_email_address_features(sender)
         features = fuse_features(email_feats, url_feats, email_addr_feats)
         X.append(features)
         y.append(label)
@@ -55,12 +57,23 @@ def build_feature_matrix(email_df, url_df):
         X.append(features)
         y.append(label)
 
+    if phishtank_df is not None and not phishtank_df.empty:
+        for _, row in phishtank_df.head(1000).iterrows():
+            url = str(row.get('url') or '')
+            label = 1
+            email_feats = extract_email_text_features(url)
+            url_feats = [extract_url_features(url)]
+            email_addr_feats = extract_email_address_features('user@example.com')
+            features = fuse_features(email_feats, url_feats, email_addr_feats)
+            X.append(features)
+            y.append(label)
+
     return np.array(X), np.array(y)
 
 
 def main():
     try:
-        email_df, url_df = load_datasets()
+        email_df, url_df, phishtank_df = load_datasets()
     except FileNotFoundError as exc:
         print(f'Error loading dataset: {exc}')
         sys.exit(1)
@@ -68,7 +81,7 @@ def main():
     email_df = normalize_labels(email_df, 'label')
     url_df = normalize_labels(url_df, 'label')
 
-    X, y = build_feature_matrix(email_df, url_df)
+    X, y = build_feature_matrix(email_df, url_df, phishtank_df)
     if len(X) == 0:
         print('No training examples were generated. Please verify the dataset schema.')
         sys.exit(1)
@@ -78,10 +91,22 @@ def main():
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    model = EnsembleClassifier(voting='soft')
+    model = EnsembleClassifier(voting='soft', version='v1.1-Ensemble')
     model.fit(X_train_scaled, y_train)
     model.scaler = scaler
     model.save(MODEL_PATHS['ensemble'], scaler_path=MODEL_PATHS['scaler'])
+    
+    xgb_base = None
+    if hasattr(model.model, 'estimators_'):
+        for name, est in zip(model.model.estimators, model.model.estimators_):
+            if name[0] == 'xgb':
+                xgb_base = est
+                break
+    if xgb_base:
+        try:
+            xgb_base.save_model(MODEL_PATHS['xgb'])
+        except Exception as e:
+            pass
 
     score = model.model.score(X_test_scaled, y_test)
     print(f'✅ Ensemble training complete. Validation accuracy: {score:.4f}')

@@ -19,6 +19,11 @@ def extract_email_text_features(text):
     text = str(text or '')
     text_lower = text.lower()
 
+    words = text.split()
+    num_words = len(words)
+    avg_word_length = np.mean([len(w) for w in words]) if words else 0.0
+    vocab_richness = len(set(words)) / num_words if num_words else 0.0
+
     return [
         len(text),
         len(extract_urls(text)),
@@ -26,6 +31,13 @@ def extract_email_text_features(text):
         text.count('!'),
         sum(c.isdigit() for c in text),
         sum(word in text_lower for word in SUSPICIOUS_WORDS),
+        num_words,
+        avg_word_length,
+        vocab_richness,
+        text_lower.count('html'),
+        sum(1 for c in text if c.isspace()),
+        1 if 'dear' in text_lower else 0,
+        1 if 'free' in text_lower else 0,
     ]
 
 
@@ -53,9 +65,18 @@ def extract_url_features(url):
     features.append(1 if '@' in url else 0)
     features.append(1 if '-' in parsed.netloc else 0)
     features.append(len(domain_parts[-1]) if domain_parts else 0)
+    
+    url_lower = url.lower()
+    features.append(1 if 'login' in url_lower else 0)
+    features.append(1 if 'admin' in url_lower else 0)
+    features.append(1 if 'client' in url_lower else 0)
+    features.append(1 if 'update' in url_lower else 0)
+    features.append(1 if 'free' in url_lower else 0)
+    features.append(1 if parsed.port is not None else 0)
+    features.append(1 if parsed.netloc.startswith('www') else 0)
 
-    features += [0] * (25 - len(features))
-    return features[:25]
+    features += [0] * (32 - len(features))
+    return features[:32]
 
 
 def extract_header_features(headers):
@@ -73,17 +94,19 @@ def fuse_features(email_text_feats, url_features_list, email_addr_feats):
     if url_features_list:
         avg_url = np.mean(url_features_list, axis=0)
     else:
-        avg_url = np.zeros(25)
+        avg_url = np.zeros(32)
     return np.concatenate([email_text_feats, avg_url, email_addr_feats])
 
 FEATURE_NAMES = [
     'email_length', 'num_urls', 'num_uppercase', 'num_exclamations',
-    'num_digits', 'suspicious_word_count'
+    'num_digits', 'suspicious_word_count', 'num_words', 'avg_word_length',
+    'vocab_richness', 'num_html', 'num_spaces', 'has_dear', 'has_free'
 ] + [
     'url_length', 'num_subdomains', 'has_ip', 'is_https', 'special_chars', 'entropy',
     'path_length', 'query_length', 'num_digits_url', 'num_letters_url',
-    'has_at', 'has_hyphen', 'tld_length'
-] + [f'feature_{i}' for i in range(12, 25)] + [
+    'has_at', 'has_hyphen', 'tld_length', 'has_login', 'has_admin', 'has_client',
+    'has_update', 'has_free_url', 'has_port', 'has_www'
+] + [f'feature_{i}' for i in range(20, 32)] + [
     'email_addr_len', 'domain_len', 'suspicious_tld', 'free_domain',
     'num_dots_domain', 'has_digits_addr', 'domain_entropy', 'has_plus'
 ]

@@ -4,6 +4,10 @@ import numpy as np
 import re
 import os
 import joblib
+import warnings
+
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 
 from feature_extraction import (
@@ -18,7 +22,9 @@ from settings import MODEL_PATHS
 from model_ensemble import EnsembleClassifier
 from shap_explainer import SHAPTopFeatures
 
+
 app = Flask(__name__, static_folder='../frontend')
+
 
 
 # Enable CORS
@@ -53,6 +59,17 @@ if scaler_path and os.path.exists(scaler_path):
 else:
     raise FileNotFoundError(f'Scaler file not found: {scaler_path}')
 
+# Initialize SHAP helper here after model and scaler are loaded
+# SHAP TreeExplainer fails on VotingClassifier, so we extract the base XGBoost tree
+base_tree_model = model
+if hasattr(model, 'model') and hasattr(model.model, 'estimators_'):
+    for name, est in zip(model.model.estimators, model.model.estimators_):
+        if name[0] == 'xgb':
+            base_tree_model = est
+            break
+
+shap_helper = SHAPTopFeatures(model=base_tree_model, scaler=scaler)
+
 # Lazy load DistilBERT model (to save memory)
 
 distilbert_model = None
@@ -84,11 +101,7 @@ def classify_phishing(features):
     features_scaled = scaler.transform([features])
     return float(model.predict_proba(features_scaled)[0][1])
 
-# -----------------------------
-# SHAP Top Features (rewritten, cached)
-# -----------------------------
 
-shap_top = SHAPTopFeatures(model=model, scaler=scaler, feature_names=FEATURE_NAMES)
 
 # -----------------------------
 # DISTILBERT EMBEDDINGS
@@ -211,19 +224,7 @@ def predict():
 
     suspicious_words = ['click', 'verify', 'password', 'login', 'pay', 'urgent']
 
-    # Handle short emails safely
-    if len(email_text.strip()) < 25:
-        if not any(word in text_lower for word in suspicious_words):
-            return jsonify({
-                'probability': 0.2,
-                'classification': 'Legitimate',
-                'confidence_label': '20.0%',
-                'top_email_features': {},
-                'top_url_features': {},
-                'top_email_address_features': {},
-                'reasoning': 'Email is too short to analyze properly. No suspicious keywords detected.',
-                'risk_score': 20.0
-            })
+    # Processing all emails without early return to ensure SHAP features are generated
     email_address = data.get('email_address', '')
 
     email_text_feats = extract_email_text_features(email_text)
@@ -238,30 +239,34 @@ def predict():
     prob = classify_phishing(fused)
     classification = 'Phishing' if prob > 0.7 else 'Legitimate'
 
-    try:
-        shap_categories = shap_top.explain_top_features_by_category(fused, top_k=5)
-    except Exception as e:
-        print(f"SHAP explanation failed: {e}")
-        shap_categories = {'email_text': {}, 'url': {}, 'email_address': {}}
+    # SHAP/top-feature explanation (robust + no random placeholders)
+    top_by_cat = shap_helper.explain_top_features_by_category(fused)
+
+    # Generate reasoning from all top features combined
+    url_from_email = urls[0] if urls else ''
+    all_top = {
+        **top_by_cat.get('email_text', {}),
+        **top_by_cat.get('url', {}),
+        **top_by_cat.get('email_address', {}),
+    }
+    reasoning = generate_reasoning(email_text, url_from_email, email_address, classification, prob, all_top)
 
     
-    # Generate reasoning from all real features combined
-    url_from_email = urls[0] if urls else ''
-    all_shap = {**shap_categories['email_text'], **shap_categories['url'], **shap_categories['email_address']}
-    reasoning = generate_reasoning(email_text, url_from_email, email_address, classification, prob, all_shap)
-    
     # Calculate risk score
-    risk_score = calculate_risk_score(prob, all_shap, email_text, url_from_email)
+    risk_score = calculate_risk_score(prob, all_top, email_text, url_from_email)
+
 
     return jsonify({
         'probability': float(prob),
         'classification': classification,
         'confidence_label': f"{(prob * 100):.1f}%",
-        'top_email_features': shap_categories['email_text'],
-        'top_url_features': shap_categories['url'],
-        'top_email_address_features': shap_categories['email_address'],
+        'top_email_features': top_by_cat.get('email_text', {}),
+        'top_url_features': top_by_cat.get('url', {}),
+        'top_email_address_features': top_by_cat.get('email_address', {}),
         'reasoning': reasoning,
-        'risk_score': risk_score
+        'risk_score': risk_score,
+        'ensemble_breakdown': getattr(model, 'last_votes', {}),
+        'model_version': getattr(model, 'version', 'v1.0')
     })
 
 @app.route('/predict_url', methods=['POST'])
@@ -273,7 +278,7 @@ def predict_url():
     url_feats = extract_url_features(url)
 
     # Empty email + sender features (to match model input size)
-    email_text_feats = np.zeros(6)
+    email_text_feats = np.zeros(13)
     email_addr_feats = np.zeros(8)
 
     fused = np.concatenate([email_text_feats, url_feats, email_addr_feats])
@@ -281,15 +286,10 @@ def predict_url():
     prob = classify_phishing(fused)
     classification = 'Phishing Website' if prob > 0.5 else 'Safe Website'
 
-    try:
-        shap_categories = shap_top.explain_top_features_by_category(fused, top_k=5)
-    except Exception as e:
-        print(f"SHAP explanation failed: {e}")
-        shap_categories = {'email_text': {}, 'url': {}, 'email_address': {}}
+    top_by_cat = shap_helper.explain_top_features_by_category(fused)
+    url_shap = top_by_cat.get('url', {})
 
-    
     # Generate reasoning from URL features only (email features are zeroed out)
-    url_shap = shap_categories['url']
     reasoning = generate_reasoning('', url, '', classification, prob, url_shap)
     
     # Calculate risk score
@@ -301,7 +301,9 @@ def predict_url():
         'confidence_label': f"{(prob * 100):.1f}%",
         'top_url_features': url_shap,
         'reasoning': reasoning,
-        'risk_score': risk_score
+        'risk_score': risk_score,
+        'ensemble_breakdown': getattr(model, 'last_votes', {}),
+        'model_version': getattr(model, 'version', 'v1.0')
     })
 
 @app.route('/')
