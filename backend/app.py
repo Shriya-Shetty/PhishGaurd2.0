@@ -1,10 +1,10 @@
 from flask import Flask, request, jsonify, send_from_directory
 import xgboost as xgb
-import shap
 import numpy as np
 import re
 import os
 import joblib
+
 
 from feature_extraction import (
     extract_email_text_features,
@@ -16,8 +16,10 @@ from feature_extraction import (
 )
 from settings import MODEL_PATHS
 from model_ensemble import EnsembleClassifier
+from shap_explainer import SHAPTopFeatures
 
 app = Flask(__name__, static_folder='../frontend')
+
 
 # Enable CORS
 @app.after_request
@@ -52,6 +54,7 @@ else:
     raise FileNotFoundError(f'Scaler file not found: {scaler_path}')
 
 # Lazy load DistilBERT model (to save memory)
+
 distilbert_model = None
 
 def get_distilbert_model():
@@ -81,77 +84,11 @@ def classify_phishing(features):
     features_scaled = scaler.transform([features])
     return float(model.predict_proba(features_scaled)[0][1])
 
-# Feature names are imported from feature_extraction.py
-# Feature category ranges (real data only)
-EMAIL_TEXT_RANGE = range(0, 6)
-URL_RANGE = range(6, 31)
-EMAIL_ADDR_RANGE = range(31, 39)
+# -----------------------------
+# SHAP Top Features (rewritten, cached)
+# -----------------------------
 
-def get_shap_by_category(features):
-    features_scaled = scaler.transform([features])
-    
-    # Try SHAP first
-    try:
-        explainer = shap.TreeExplainer(model)
-        shap_raw = explainer.shap_values(features_scaled)
-        
-        if isinstance(shap_raw, list):
-            shap_raw = shap_raw[1]  # positive class (phishing)
-        
-        shap_values = shap_raw[0]  # first sample
-        
-        def get_top(indices, count=5):
-            vals = {FEATURE_NAMES[i]: float(shap_values[i]) for i in indices}
-            vals = {k: v for k, v in vals.items() if abs(v) > 1e-10}
-            return dict(sorted(vals.items(), key=lambda x: abs(x[1]), reverse=True)[:count])
-        
-        result = {
-            'email_text': get_top(EMAIL_TEXT_RANGE),
-            'url': get_top(URL_RANGE),
-            'email_address': get_top(EMAIL_ADDR_RANGE)
-        }
-        
-        # If SHAP returned empty results, fall through to native importance
-        if not any(result.values()):
-            print("[DEBUG] SHAP returned all zeros — using native importance fallback.")
-            return _native_feature_importance(features)
-        return result
-        
-    except Exception as e:
-        print(f"[DEBUG] TreeExplainer failed: {e}. Using native importance fallback.")
-        return _native_feature_importance(features)
-
-
-def _native_feature_importance(features):
-    """Model-agnostic feature importance via one-at-a-time perturbation.
-    Zeroes each feature, measures probability drop vs baseline — guaranteed to work."""
-    baseline_prob = classify_phishing(features)
-    
-    # Use training mean (0 for most standardized features) as perturbation value
-    perturbed = np.array(features, dtype=float)
-    impacts = {}
-    for i in range(len(FEATURE_NAMES)):
-        original = perturbed[i]
-        perturbed[i] = 0.0
-        new_prob = classify_phishing(perturbed)
-        perturbed[i] = original
-        # Impact = how much probability changes when feature is removed
-        impacts[i] = abs(baseline_prob - new_prob)
-    
-    def get_top(indices, count=5):
-        vals = {FEATURE_NAMES[i]: round(float(impacts[i]), 4) for i in indices if impacts[i] > 1e-6}
-        # Normalize to ~SHAP scale (0-1)
-        if vals:
-            max_v = max(abs(v) for v in vals.values())
-            if max_v > 0:
-                vals = {k: round(v / max_v, 4) for k, v in vals.items()}
-        return dict(sorted(vals.items(), key=lambda x: abs(x[1]), reverse=True)[:count])
-    
-    return {
-        'email_text': get_top(EMAIL_TEXT_RANGE),
-        'url': get_top(URL_RANGE),
-        'email_address': get_top(EMAIL_ADDR_RANGE)
-    }
+shap_top = SHAPTopFeatures(model=model, scaler=scaler, feature_names=FEATURE_NAMES)
 
 # -----------------------------
 # DISTILBERT EMBEDDINGS
@@ -160,6 +97,7 @@ def _native_feature_importance(features):
 def get_text_embedding(text):
     """Get DistilBERT embedding for text"""
     model = get_distilbert_model()
+
     if model is None:
         return np.zeros(768)  # Return zeros if model not available
     embedding = model.encode(text, convert_to_numpy=True)
@@ -301,10 +239,11 @@ def predict():
     classification = 'Phishing' if prob > 0.7 else 'Legitimate'
 
     try:
-        shap_categories = get_shap_by_category(fused)
+        shap_categories = shap_top.explain_top_features_by_category(fused, top_k=5)
     except Exception as e:
         print(f"SHAP explanation failed: {e}")
         shap_categories = {'email_text': {}, 'url': {}, 'email_address': {}}
+
     
     # Generate reasoning from all real features combined
     url_from_email = urls[0] if urls else ''
@@ -343,10 +282,11 @@ def predict_url():
     classification = 'Phishing Website' if prob > 0.5 else 'Safe Website'
 
     try:
-        shap_categories = get_shap_by_category(fused)
+        shap_categories = shap_top.explain_top_features_by_category(fused, top_k=5)
     except Exception as e:
         print(f"SHAP explanation failed: {e}")
         shap_categories = {'email_text': {}, 'url': {}, 'email_address': {}}
+
     
     # Generate reasoning from URL features only (email features are zeroed out)
     url_shap = shap_categories['url']
