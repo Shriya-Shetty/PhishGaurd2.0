@@ -4,3 +4,9 @@ __pycache__/
 *.csv
 .env
 dataset/
+
+# Ignore all JSON files
+client_secret_420472804087-eqoa3usaft2q4nl3a9ta0qj1otfb9olk.apps.googleusercontent.com copy.json
+credentials.json
+# Ignore all pickle files
+*.pkl

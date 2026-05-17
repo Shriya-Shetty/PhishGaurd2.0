@@ -2,7 +2,10 @@
 import os
 from typing import Optional
 
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.modify',
+]
 
 
 def _import_google_libraries():

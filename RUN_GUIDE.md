@@ -86,6 +86,30 @@ The server will start at `http://localhost:5000`.
 
 > **Note:** `backend/app.py` loads the ensemble model automatically if `backend/ensemble_model.pkl` exists.
 
+### Gmail integration (read/unread polling + SQLite logging)
+
+This project also includes a Gmail reader (OAuth) that processes **UNREAD** Gmail messages and logs results into SQLite.
+
+#### 1) Ensure Gmail OAuth credentials exist
+- The Gmail helper uses `credentials.json` by default.
+- Place your Gmail OAuth client credentials file at: `backend/credentials.json` (or change `backend/gmail_api.py` defaults).
+
+#### 2) Process unread messages
+```powershell
+# processes up to 10 unread messages by default
+Invoke-RestMethod -Method Post -Uri http://localhost:5000/gmail/process_once -ContentType 'application/json' -Body '{"max_messages": 10}'
+```
+
+#### 3) Check unread count
+```powershell
+Invoke-RestMethod -Method Get -Uri http://localhost:5000/gmail/unread_count
+```
+
+#### 4) SQLite logs
+- SQLite DB path: `backend/phishguard.db`
+- Gmail + prediction logs stored in: `gmail_messages` table (linked to rows in `predictions`).
+
+
 ---
 
 ## Using the Application
